@@ -53,21 +53,31 @@ export function buildEndlessNavEnvironment(scene: THREE.Scene): EndlessNavEnviro
         indices,
     };
 
+    const cellSize = 0.4;
+    const cellHeight = 0.2;
+    const walkableRadiusWorld = 0.4;
+    const walkableClimbWorld = 0.4;
+    const walkableHeightWorld = 1.8;
+
     const options: SoloNavMeshOptions = {
-        cellSize: 0.5,
-        cellHeight: 0.3,
-        walkableRadiusWorld: 0.3,
-        walkableRadiusVoxels: 1,
-        walkableClimbWorld: 0.5,
-        walkableClimbVoxels: 2,
-        walkableHeightWorld: 1.8,
-        walkableHeightVoxels: 6,
+        cellSize,
+        cellHeight,
+        walkableRadiusWorld,
+        walkableRadiusVoxels: Math.ceil(walkableRadiusWorld / cellSize),
+        walkableClimbWorld,
+        walkableClimbVoxels: Math.ceil(walkableClimbWorld / cellHeight),
+        walkableHeightWorld,
+        walkableHeightVoxels: Math.ceil(walkableHeightWorld / cellHeight),
         walkableSlopeAngleDegrees: 45,
+        borderSize: 1,
         minRegionArea: 8,
-        mergeRegionArea: 12,
-        detailSampleDistance: 1,
-        detailSampleMaxError: 0.5,
-    } as SoloNavMeshOptions;
+        mergeRegionArea: 20,
+        maxSimplificationError: 1.3,
+        maxEdgeLength: 12,
+        maxVerticesPerPoly: 6,
+        detailSampleDistance: cellSize * 6,
+        detailSampleMaxError: cellHeight * 1.5,
+    } satisfies SoloNavMeshOptions;
 
     const { navMesh } = generateSoloNavMesh(input, options);
 
