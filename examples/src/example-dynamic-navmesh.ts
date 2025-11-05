@@ -1,5 +1,6 @@
 import Rapier from '@dimforge/rapier3d-compat';
 import { GUI } from 'lil-gui';
+import Stats from 'stats-gl';
 import { box3, triangle3, vec2, type Vec3, vec3 } from 'mathcat';
 import {
     addOffMeshConnection,
@@ -51,6 +52,7 @@ await Rapier.init();
 const guiSettings = {
     showPathLine: true,
     showRapierDebug: true,
+    showTileFlash: false,
 };
 
 const navMeshConfig = {
@@ -69,12 +71,29 @@ const navMeshConfig = {
     maxVerticesPerPoly: 5,
     detailSampleDistance: 6,
     detailSampleMaxError: 1,
-    tileRebuildThrottleMs: 1000,
+    tileRebuildThrottleMs: 500,
+    maxPerFrame: 5,
+};
+
+const physicsObjectsConfig = {
+    minSize: 0.20,
+    maxSize: 0.7,
+    count: 50,
+    respawnIntervalMs: 10000,
+};
+
+const physicsShapesConfig = {
+    box: true,
+    sphere: true,
+    capsule: true,
+    cylinder: true,
+    cone: false,
 };
 
 const gui = new GUI();
 gui.add(guiSettings, 'showPathLine').name('Show Path Line');
 gui.add(guiSettings, 'showRapierDebug').name('Show Rapier Debug');
+gui.add(guiSettings, 'showTileFlash').name('Show Tile Flash');
 
 const navMeshFolder = gui.addFolder('NavMesh');
 navMeshFolder.add(navMeshConfig, 'cellSize', 0.05, 1, 0.01).name('Cell Size');
@@ -114,6 +133,10 @@ navMeshFolder
     .onChange(() => {
         TILE_REBUILD_THROTTLE_MS.current = Math.max(0, navMeshConfig.tileRebuildThrottleMs);
     });
+navMeshFolder.add(navMeshConfig, 'maxPerFrame', 1, 10, 1).name('Max Rebuilds Per Frame');
+
+// Physics Objects GUI will be set up after physics world is created
+let physicsObjectsFolder: GUI | null = null;
 
 /* setup example scene */
 const container = document.getElementById('root')!;
@@ -154,6 +177,23 @@ window.addEventListener('resize', onWindowResize);
 
 await renderer.init();
 
+// stats
+const stats = new Stats({
+    trackGPU: true,
+    trackHz: false,
+    trackCPT: false,
+    logsPerSecond: 4,
+    graphsPerSecond: 30,
+    samplesLog: 40,
+    samplesGraph: 10,
+    precision: 2,
+    horizontal: true,
+    minimal: false,
+    mode: 0,
+});
+container.appendChild(stats.dom);
+stats.init(renderer);
+
 // controls
 const orbitControls = new OrbitControls(camera, renderer.domElement);
 orbitControls.enableDamping = true;
@@ -161,6 +201,13 @@ orbitControls.enableDamping = true;
 // load level model
 const levelModel = await loadGLTF('./models/nav-test.glb');
 scene.add(levelModel.scene);
+
+// compute bounding box of level model for spawn area
+const levelBoundingBox = new THREE.Box3().setFromObject(levelModel.scene);
+const levelSpawnMin = levelBoundingBox.min;
+const levelSpawnMax = levelBoundingBox.max;
+const levelSpawnHeight = levelBoundingBox.max.y;
+const levelHeight = levelBoundingBox.max.y - levelBoundingBox.min.y;
 
 // load cat model for agents
 const catModel = await loadGLTF('./models/cat.gltf');
@@ -575,10 +622,12 @@ const processRebuildQueue = (maxPerFrame: number) => {
                     scene.add(newTileHelper.object);
                     tileHelpers.set(tileKeyStr, newTileHelper);
 
-                    tileFlashes.set(tileKeyStr, {
-                        startTime: performance.now(),
-                        duration: 1500,
-                    });
+                    if (guiSettings.showTileFlash) {
+                        tileFlashes.set(tileKeyStr, {
+                            startTime: performance.now(),
+                            duration: 1500,
+                        });
+                    }
 
                     break;
                 }
@@ -748,6 +797,8 @@ const physicsWorld = new Rapier.World(new Rapier.Vector3(0, -9.81, 0));
 /* create fixed trimesh collider for level */
 const levelColliderDesc = Rapier.ColliderDesc.trimesh(new Float32Array(levelPositions), new Uint32Array(levelIndices));
 levelColliderDesc.setMass(0);
+levelColliderDesc.setRestitution(0.02);
+levelColliderDesc.setFriction(0.5);
 
 const levelRigidBodyDesc = Rapier.RigidBodyDesc.fixed();
 const levelRigidBody = physicsWorld.createRigidBody(levelRigidBodyDesc);
@@ -812,75 +863,237 @@ const renderRapierDebug = (): void => {
     }
 };
 
-/* create a bunch of dynamic boxes */
-for (let i = 0; i < 20; i++) {
-    // visual
-    const boxSizeX = 0.4 + Math.random() * 0.6;
-    const boxSizeZ = 0.4 + Math.random() * 0.6;
+// helper function to get random spawn position above the level
+const getRandomSpawnPosition = (objectHeight: number, index: number): [number, number, number] => {
+    const x = levelSpawnMin.x + Math.random() * (levelSpawnMax.x - levelSpawnMin.x);
+    const z = levelSpawnMin.z + Math.random() * (levelSpawnMax.z - levelSpawnMin.z);
+    const y = levelSpawnHeight + levelHeight * 2 + objectHeight / 2;
+    return [x, y, z];
+};
+
+type ShapeType = 'box' | 'sphere' | 'capsule' | 'cylinder' | 'cone';
+
+type ShapeData = {
+    mesh: THREE.Mesh;
+    colliderDesc: Rapier.ColliderDesc;
+    height: number;
+};
+
+const createRandomShape = (minSize: number = physicsObjectsConfig.minSize, maxSize: number = physicsObjectsConfig.maxSize): ShapeData => {
+    // Filter to only enabled shapes
+    const allShapeTypes: ShapeType[] = ['box', 'sphere', 'capsule', 'cylinder', 'cone'];
+    const enabledShapeTypes = allShapeTypes.filter((shapeType) => {
+        const key = shapeType as keyof typeof physicsShapesConfig;
+        return physicsShapesConfig[key];
+    });
+    
+    if (enabledShapeTypes.length === 0) {
+        // Fallback: if no shapes enabled, use box
+        console.warn('No shapes enabled, using box as fallback');
+        enabledShapeTypes.push('box');
+    }
+    
+    const shapeType = enabledShapeTypes[Math.floor(Math.random() * enabledShapeTypes.length)];
+
+    const baseSize = minSize + Math.random() * (maxSize - minSize);
     const minHeight = 0.25;
-    const maxHeight = 1.6;
-    const boxHeight = minHeight + Math.random() * (maxHeight - minHeight);
+    const maxHeight = maxSize * 2.28; // approximately maintain the same ratio as before
 
-    const boxGeometry = new THREE.BoxGeometry(boxSizeX, boxHeight, boxSizeZ);
-    const boxMaterial = new THREE.MeshStandardMaterial({ color: 0xff0000 });
-    const boxMesh = new THREE.Mesh(boxGeometry, boxMaterial);
+    let mesh: THREE.Mesh;
+    let colliderDesc: Rapier.ColliderDesc;
+    let height: number;
 
-    scene.add(boxMesh);
-    raycastTargets.push(boxMesh);
-
-    // physics
-    const boxColliderDesc = Rapier.ColliderDesc.cuboid(boxSizeX / 2, boxHeight / 2, boxSizeZ / 2);
-    boxColliderDesc.setRestitution(0.1);
-    boxColliderDesc.setFriction(0.5);
-    boxColliderDesc.setDensity(1.0);
-    const boxRigidBodyDesc = Rapier.RigidBodyDesc.dynamic().setTranslation(
-        (Math.random() - 0.5) * 8,
-        10 + i * 2 + boxHeight,
-        (Math.random() - 0.5) * 8,
-    );
-
-    const boxRigidBody = physicsWorld.createRigidBody(boxRigidBodyDesc);
-
-    physicsWorld.createCollider(boxColliderDesc, boxRigidBody);
-
-    // compute approximate radius from geometry bounding sphere
-    const geom = (boxMesh as any).geometry as THREE.BufferGeometry;
-    if (!geom.boundingSphere) geom.computeBoundingSphere();
-    const bs = geom.boundingSphere!;
-    const worldRadius = bs.radius * (boxMesh.scale.x || 1) || 0.5;
-
-    // find current tiles overlapping the object's bounding box
-    const pos = boxMesh.position;
-    const r = worldRadius;
-    const min: Vec3 = [pos.x - r, pos.y - r, pos.z - r];
-    const max: Vec3 = [pos.x + r, pos.y + r, pos.z + r];
-
-    const tiles = tilesForAABB(min, max);
-    const tilesSet = new Set<string>();
-    for (const [tx, ty] of tiles) {
-        const k = tileKey(tx, ty);
-        tilesSet.add(k);
-        let s = tileToObjects.get(k);
-        if (!s) {
-            s = new Set<number>();
-            tileToObjects.set(k, s);
+    switch (shapeType) {
+        case 'box': {
+            const sizeX = baseSize + Math.random() * 0.45; // 0.3 * 1.5 = 0.45 (50% bigger max)
+            const sizeZ = baseSize + Math.random() * 0.45; // 0.3 * 1.5 = 0.45 (50% bigger max)
+            height = minHeight + Math.random() * (maxHeight - minHeight);
+            const boxGeometry = new THREE.BoxGeometry(sizeX, height, sizeZ);
+            const boxMaterial = new THREE.MeshStandardMaterial({ color: 0xff0000 });
+            mesh = new THREE.Mesh(boxGeometry, boxMaterial);
+            colliderDesc = Rapier.ColliderDesc.cuboid(sizeX / 2, height / 2, sizeZ / 2);
+            break;
         }
-        s.add(i);
-        enqueueTile(tx, ty);
+        case 'sphere': {
+            const radius = baseSize * 0.8;
+            height = radius * 2;
+            const sphereGeometry = new THREE.SphereGeometry(radius, 16, 16);
+            const sphereMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+            mesh = new THREE.Mesh(sphereGeometry, sphereMaterial);
+            colliderDesc = Rapier.ColliderDesc.ball(radius);
+            break;
+        }
+        case 'capsule': {
+            const radius = baseSize * 0.5;
+            const halfHeight = minHeight * 0.5 + Math.random() * (maxHeight * 0.5 - minHeight * 0.5);
+            height = halfHeight * 2 + radius * 2;
+            const capsuleGeometry = new THREE.CapsuleGeometry(radius, halfHeight * 2, 8, 16);
+            const capsuleMaterial = new THREE.MeshStandardMaterial({ color: 0x0000ff });
+            mesh = new THREE.Mesh(capsuleGeometry, capsuleMaterial);
+            colliderDesc = Rapier.ColliderDesc.capsule(halfHeight, radius);
+            break;
+        }
+        case 'cylinder': {
+            const radius = baseSize * 0.6;
+            height = minHeight + Math.random() * (maxHeight - minHeight);
+            const cylinderGeometry = new THREE.CylinderGeometry(radius, radius, height, 16);
+            const cylinderMaterial = new THREE.MeshStandardMaterial({ color: 0xffff00 });
+            mesh = new THREE.Mesh(cylinderGeometry, cylinderMaterial);
+            colliderDesc = Rapier.ColliderDesc.cylinder(height / 2, radius);
+            break;
+        }
+        case 'cone': {
+            const radius = baseSize * 0.6;
+            height = minHeight + Math.random() * (maxHeight - minHeight);
+            const coneGeometry = new THREE.ConeGeometry(radius, height, 16);
+            const coneMaterial = new THREE.MeshStandardMaterial({ color: 0xff00ff });
+            mesh = new THREE.Mesh(coneGeometry, coneMaterial);
+            colliderDesc = Rapier.ColliderDesc.cone(height / 2, radius);
+            break;
+        }
     }
 
-    // add the physics object
-    const physicsObject: PhysicsObj = {
-        rigidBody: boxRigidBody,
-        mesh: boxMesh,
-        lastRespawn: performance.now(),
-        lastPosition: [boxRigidBody.translation().x, boxRigidBody.translation().y, boxRigidBody.translation().z],
-        lastTiles: tilesSet,
-        radius: worldRadius,
-    };
+    colliderDesc.setRestitution(0.02);
+    colliderDesc.setFriction(0.5);
+    colliderDesc.setDensity(1.0);
 
-    physicsObjects.push(physicsObject);
-}
+    return { mesh, colliderDesc, height };
+};
+
+const removeAllPhysicsObjects = () => {
+    // Remove all objects and clean up tile mappings
+    for (let i = 0; i < physicsObjects.length; i++) {
+        const obj = physicsObjects[i];
+        // remove from scene
+        scene.remove(obj.mesh);
+        // remove from raycast targets
+        const raycastIndex = raycastTargets.indexOf(obj.mesh);
+        if (raycastIndex !== -1) {
+            raycastTargets.splice(raycastIndex, 1);
+        }
+        // remove from physics world
+        physicsWorld.removeRigidBody(obj.rigidBody);
+        // remove from tile mappings using the index
+        for (const tileKey of obj.lastTiles) {
+            const tileSet = tileToObjects.get(tileKey);
+            if (tileSet) {
+                tileSet.delete(i);
+                if (tileSet.size === 0) {
+                    tileToObjects.delete(tileKey);
+                }
+            }
+        }
+    }
+    physicsObjects.length = 0;
+};
+
+const createPhysicsObjects = (count: number) => {
+    for (let i = 0; i < count; i++) {
+        const { mesh, colliderDesc, height } = createRandomShape();
+
+        scene.add(mesh);
+        raycastTargets.push(mesh);
+
+        const [spawnX, spawnY, spawnZ] = getRandomSpawnPosition(height, i);
+        const rigidBodyDesc = Rapier.RigidBodyDesc.dynamic().setTranslation(spawnX, spawnY, spawnZ);
+
+        const rigidBody = physicsWorld.createRigidBody(rigidBodyDesc);
+        physicsWorld.createCollider(colliderDesc, rigidBody);
+
+        // compute approximate radius from geometry bounding sphere
+        const geom = mesh.geometry as THREE.BufferGeometry;
+        if (!geom.boundingSphere) geom.computeBoundingSphere();
+        const bs = geom.boundingSphere!;
+        const worldRadius = bs.radius * (mesh.scale.x || 1) || 0.5;
+
+        // find current tiles overlapping the object's bounding box
+        const pos = mesh.position;
+        const r = worldRadius;
+        const min: Vec3 = [pos.x - r, pos.y - r, pos.z - r];
+        const max: Vec3 = [pos.x + r, pos.y + r, pos.z + r];
+
+        const tiles = tilesForAABB(min, max);
+        const tilesSet = new Set<string>();
+        const objIndex = physicsObjects.length; // use current length as index
+        for (const [tx, ty] of tiles) {
+            const k = tileKey(tx, ty);
+            tilesSet.add(k);
+            let s = tileToObjects.get(k);
+            if (!s) {
+                s = new Set<number>();
+                tileToObjects.set(k, s);
+            }
+            s.add(objIndex);
+            enqueueTile(tx, ty);
+        }
+
+        // add the physics object
+        const physicsObject: PhysicsObj = {
+            rigidBody,
+            mesh,
+            lastRespawn: performance.now(),
+            lastPosition: [rigidBody.translation().x, rigidBody.translation().y, rigidBody.translation().z],
+            lastTiles: tilesSet,
+            radius: worldRadius,
+        };
+
+        physicsObjects.push(physicsObject);
+    }
+};
+
+const regeneratePhysicsObjects = () => {
+    removeAllPhysicsObjects();
+    createPhysicsObjects(Math.max(0, Math.floor(physicsObjectsConfig.count)));
+    // rebuild all tiles since objects changed
+    queueAllTiles();
+};
+
+// Set up Physics Objects GUI folder now that regeneratePhysicsObjects is defined
+physicsObjectsFolder = gui.addFolder('Physics Objects');
+physicsObjectsFolder
+    .add(physicsObjectsConfig, 'minSize', 0.1, 2, 0.01)
+    .name('Min Size')
+    .onChange(() => {
+        // ensure minSize <= maxSize
+        if (physicsObjectsConfig.minSize > physicsObjectsConfig.maxSize) {
+            physicsObjectsConfig.maxSize = physicsObjectsConfig.minSize;
+        }
+        // Size changes only affect newly spawned objects, not existing ones
+    });
+physicsObjectsFolder
+    .add(physicsObjectsConfig, 'maxSize', 0.1, 3, 0.01)
+    .name('Max Size')
+    .onChange(() => {
+        // ensure minSize <= maxSize
+        if (physicsObjectsConfig.maxSize < physicsObjectsConfig.minSize) {
+            physicsObjectsConfig.minSize = physicsObjectsConfig.maxSize;
+        }
+        // Size changes only affect newly spawned objects, not existing ones
+    });
+physicsObjectsFolder
+    .add(physicsObjectsConfig, 'count', 0, 100, 1)
+    .name('Count')
+    .onChange(() => {
+        regeneratePhysicsObjects();
+    });
+physicsObjectsFolder
+    .add(physicsObjectsConfig, 'respawnIntervalMs', 1000, 60000, 1000)
+    .name('Respawn Interval (ms)');
+
+const physicsShapesFolder = physicsObjectsFolder.addFolder('Shapes');
+physicsShapesFolder.add(physicsShapesConfig, 'box').name('Box');
+physicsShapesFolder.add(physicsShapesConfig, 'sphere').name('Sphere');
+physicsShapesFolder.add(physicsShapesConfig, 'capsule').name('Capsule');
+physicsShapesFolder.add(physicsShapesConfig, 'cylinder').name('Cylinder');
+physicsShapesFolder.add(physicsShapesConfig, 'cone').name('Cone');
+
+const physicsObjectsActions = {
+    reset: () => regeneratePhysicsObjects(),
+};
+physicsObjectsFolder.add(physicsObjectsActions, 'reset').name('Reset Physics Objects');
+
+/* create a bunch of dynamic physics objects with various shapes */
+createPhysicsObjects(physicsObjectsConfig.count);
 
 /* Agent visuals */
 type AgentVisuals = {
@@ -1252,19 +1465,20 @@ function update() {
         obj.mesh.quaternion.set(rotation.x, rotation.y, rotation.z, rotation.w);
     }
 
-    // respawn boxes that fall below certain height OR every 10 seconds since last respawn
-    const RESPAWN_INTERVAL_MS = 10000;
+    // respawn objects that fall below certain height OR every respawnIntervalMs since last respawn
     for (const obj of physicsObjects) {
         const position = obj.rigidBody.translation();
         const nowMs = performance.now();
 
         const fellOut = position.y < -10;
-        const periodic = nowMs - (obj.lastRespawn ?? 0) >= RESPAWN_INTERVAL_MS;
+        const periodic = nowMs - (obj.lastRespawn ?? 0) >= physicsObjectsConfig.respawnIntervalMs;
 
         if (fellOut || periodic) {
-            const x = (Math.random() - 0.5) * 8;
-            const y = 10;
-            const z = (Math.random() - 0.5) * 8;
+            // compute object height from mesh geometry
+            const geom = obj.mesh.geometry as THREE.BufferGeometry;
+            if (!geom.boundingBox) geom.computeBoundingBox();
+            const objectHeight = geom.boundingBox ? geom.boundingBox.max.y - geom.boundingBox.min.y : 0.5;
+            const [x, y, z] = getRandomSpawnPosition(objectHeight, 0);
 
             // teleport and clear velocities
             obj.rigidBody.setTranslation({ x, y, z }, true);
@@ -1347,56 +1561,76 @@ function update() {
         obj.lastPosition = curPos;
     }
 
-    // process at most 1 tile rebuild per frame
+    // process tiles up to maxPerFrame per frame
     console.time('tick processRebuildQueue');
-    processRebuildQueue(1);
+    processRebuildQueue(navMeshConfig.maxPerFrame);
     console.timeEnd('tick processRebuildQueue');
 
     // update tile visuals
-    const now = performance.now();
-    const flashesToRemove: string[] = [];
+    if (guiSettings.showTileFlash) {
+        const now = performance.now();
+        const flashesToRemove: string[] = [];
 
-    for (const [tileKey, flash] of tileFlashes) {
-        const elapsed = now - flash.startTime;
-        const t = Math.min(elapsed / flash.duration, 1.0); // normalized time [0, 1]
+        for (const [tileKey, flash] of tileFlashes) {
+            const elapsed = now - flash.startTime;
+            const t = Math.min(elapsed / flash.duration, 1.0); // normalized time [0, 1]
 
-        const tileHelper = tileHelpers.get(tileKey);
-        if (tileHelper) {
-            const fadeAmount = (1.0 - t) ** 3;
+            const tileHelper = tileHelpers.get(tileKey);
+            if (tileHelper) {
+                const fadeAmount = (1.0 - t) ** 3;
 
-            tileHelper.object.traverse((child) => {
-                if (child instanceof THREE.Mesh && child.material instanceof THREE.Material) {
-                    const material = child.material as THREE.MeshBasicMaterial;
+                tileHelper.object.traverse((child) => {
+                    if (child instanceof THREE.Mesh && child.material instanceof THREE.Material) {
+                        const material = child.material as THREE.MeshBasicMaterial;
 
-                    const baseColor = 0x222222;
-                    const flashColor = 0x005500;
+                        const baseColor = 0x222222;
+                        const flashColor = 0x005500;
 
-                    const baseR = (baseColor >> 16) & 0xff;
-                    const baseG = (baseColor >> 8) & 0xff;
-                    const baseB = baseColor & 0xff;
+                        const baseR = (baseColor >> 16) & 0xff;
+                        const baseG = (baseColor >> 8) & 0xff;
+                        const baseB = baseColor & 0xff;
 
-                    const flashR = (flashColor >> 16) & 0xff;
-                    const flashG = (flashColor >> 8) & 0xff;
-                    const flashB = flashColor & 0xff;
+                        const flashR = (flashColor >> 16) & 0xff;
+                        const flashG = (flashColor >> 8) & 0xff;
+                        const flashB = flashColor & 0xff;
 
-                    const r = Math.round(flashR * fadeAmount + baseR * (1 - fadeAmount));
-                    const g = Math.round(flashG * fadeAmount + baseG * (1 - fadeAmount));
-                    const b = Math.round(flashB * fadeAmount + baseB * (1 - fadeAmount));
+                        const r = Math.round(flashR * fadeAmount + baseR * (1 - fadeAmount));
+                        const g = Math.round(flashG * fadeAmount + baseG * (1 - fadeAmount));
+                        const b = Math.round(flashB * fadeAmount + baseB * (1 - fadeAmount));
 
-                    const color = (r << 16) | (g << 8) | b;
-                    material.color.setHex(color);
-                    material.vertexColors = false;
+                        const color = (r << 16) | (g << 8) | b;
+                        material.color.setHex(color);
+                        material.vertexColors = false;
+                    }
+                });
+            }
+
+            if (t >= 1.0) {
+                flashesToRemove.push(tileKey);
+            }
+        }
+
+        for (const key of flashesToRemove) {
+            tileFlashes.delete(key);
+        }
+    } else {
+        // Clear all flashes when disabled
+        if (tileFlashes.size > 0) {
+            // Reset tile colors to base color
+            for (const [tileKey] of tileFlashes) {
+                const tileHelper = tileHelpers.get(tileKey);
+                if (tileHelper) {
+                    tileHelper.object.traverse((child) => {
+                        if (child instanceof THREE.Mesh && child.material instanceof THREE.Material) {
+                            const material = child.material as THREE.MeshBasicMaterial;
+                            material.color.setHex(0x222222);
+                            material.vertexColors = false;
+                        }
+                    });
                 }
-            });
+            }
+            tileFlashes.clear();
         }
-
-        if (t >= 1.0) {
-            flashesToRemove.push(tileKey);
-        }
-    }
-
-    for (const key of flashesToRemove) {
-        tileFlashes.delete(key);
     }
 
     // Rapier debug rendering (lines)
@@ -1421,6 +1655,9 @@ function update() {
 
     // render
     renderer.render(scene, camera);
+
+    // update stats
+    stats.update();
 }
 
 update();

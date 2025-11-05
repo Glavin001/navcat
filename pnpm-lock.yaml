@@ -66,6 +66,9 @@ importers:
       navcat:
         specifier: workspace:*
         version: link:..
+      stats-gl:
+        specifier: ^3.6.0
+        version: 3.6.0(three@0.180.0)
       three:
         specifier: ^0.180.0
         version: 0.180.0
@@ -2580,6 +2583,17 @@ packages:
   /stackback@0.0.2:
     resolution: {integrity: sha512-1XMJE5fQo1jGH6Y/7ebnwPOBEkIEnT4QF32d5R1+VXdXveM0IBMJt8zfaxX1P3QhVwrYe+576+jkANtSS2mBbw==}
     dev: true
+
+  /stats-gl@3.6.0(three@0.180.0):
+    resolution: {integrity: sha512-Bpi5nwvC2pls9lcI5sGqAcUqB/2kMYfsR4KoAglXFtY3YUdm7lJFg8FqS7eKKNgg3ruDMNCuwU+uRwPOwJiGnw==}
+    peerDependencies:
+      three: '*'
+    peerDependenciesMeta:
+      three:
+        optional: true
+    dependencies:
+      three: 0.180.0
+    dev: false
 
   /std-env@3.9.0:
     resolution: {integrity: sha512-UGvjygr6F6tpH7o2qyqR6QYpwraIjKSdtzyBdyytFOHmPZY917kwdwLG0RbOjWOnKmnm3PeHjaoLLMie7kPLQw==}
